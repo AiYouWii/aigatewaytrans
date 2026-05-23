@@ -1,0 +1,308 @@
+from __future__ import annotations
+
+import json
+import uuid
+from typing import Any
+
+from app.models import ChatCompletionStreamChunk
+
+
+class StreamState:
+    def __init__(self, response_id: str, model: str | None = None):
+        self.response_id = response_id
+        self.model = model
+        self.msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+        self.text_accumulator = ""
+        self.tool_call_accumulators: dict[int, dict[str, str]] = {}
+        self.output_item_started = False
+        self.content_part_started = False
+        self.text_started = False
+        self.initial_events_emitted = False
+        self.finished = False
+
+
+def emit_initial_events(state: StreamState) -> list[str]:
+    if state.initial_events_emitted:
+        return []
+    state.initial_events_emitted = True
+
+    lines = []
+    lines.append(
+        _sse_line(
+            "response.created",
+            {
+                "id": state.response_id,
+                "object": "response",
+                "model": state.model,
+                "status": "in_progress",
+                "output": [],
+            },
+        )
+    )
+
+    state.output_item_started = True
+    lines.append(
+        _sse_line(
+            "response.output_item.added",
+            {
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": state.msg_id,
+                    "role": "assistant",
+                    "content": [],
+                },
+            },
+        )
+    )
+
+    state.content_part_started = True
+    lines.append(
+        _sse_line(
+            "response.content_part.added",
+            {
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": ""},
+            },
+        )
+    )
+
+    return lines
+
+
+def process_chunk(chunk: ChatCompletionStreamChunk, state: StreamState) -> list[str]:
+    lines = emit_initial_events(state)
+
+    if not chunk.choices:
+        return lines
+
+    choice = chunk.choices[0]
+    delta = choice.delta
+
+    if delta.content:
+        state.text_started = True
+        state.text_accumulator += delta.content
+        lines.append(
+            _sse_line(
+                "response.output_text.delta",
+                {
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": delta.content,
+                },
+            )
+        )
+
+    if delta.tool_calls:
+        for tc in delta.tool_calls:
+            idx = tc.index
+            if idx not in state.tool_call_accumulators:
+                state.tool_call_accumulators[idx] = {
+                    "id": tc.id or "",
+                    "name": tc.function.name or "",
+                    "arguments": "",
+                    "fc_id": f"fc_{uuid.uuid4().hex[:24]}",
+                }
+                lines.append(
+                    _sse_line(
+                        "response.output_item.added",
+                        {
+                            "output_index": idx + 1,
+                            "item": {
+                                "type": "function_call",
+                                "id": state.tool_call_accumulators[idx]["fc_id"],
+                                "call_id": tc.id or "",
+                                "name": tc.function.name or "",
+                                "arguments": "",
+                            },
+                        },
+                    )
+                )
+
+            if tc.function.name:
+                state.tool_call_accumulators[idx]["name"] = tc.function.name
+            if tc.function.arguments:
+                state.tool_call_accumulators[idx]["arguments"] += tc.function.arguments
+                lines.append(
+                    _sse_line(
+                        "response.function_call_arguments.delta",
+                        {
+                            "output_index": idx + 1,
+                            "delta": tc.function.arguments,
+                        },
+                    )
+                )
+
+    if choice.finish_reason:
+        lines.extend(emit_done_events(state, chunk))
+
+    return lines
+
+
+def emit_done_events(state: StreamState, chunk: ChatCompletionStreamChunk) -> list[str]:
+    if state.finished:
+        return []
+    state.finished = True
+
+    lines = []
+
+    if state.text_started:
+        lines.append(
+            _sse_line(
+                "response.output_text.done",
+                {
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": state.text_accumulator,
+                },
+            )
+        )
+        lines.append(
+            _sse_line(
+                "response.content_part.done",
+                {
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": {
+                        "type": "output_text",
+                        "text": state.text_accumulator,
+                    },
+                },
+            )
+        )
+
+    if state.output_item_started:
+        content = []
+        if state.text_accumulator:
+            content.append({"type": "output_text", "text": state.text_accumulator})
+        lines.append(
+            _sse_line(
+                "response.output_item.done",
+                {
+                    "output_index": 0,
+                    "item": {
+                        "type": "message",
+                        "id": state.msg_id,
+                        "role": "assistant",
+                        "content": content,
+                    },
+                },
+            )
+        )
+
+    for idx, acc in sorted(state.tool_call_accumulators.items()):
+        lines.append(
+            _sse_line(
+                "response.function_call_arguments.done",
+                {
+                    "output_index": idx + 1,
+                    "arguments": acc["arguments"],
+                },
+            )
+        )
+        lines.append(
+            _sse_line(
+                "response.output_item.done",
+                {
+                    "output_index": idx + 1,
+                    "item": {
+                        "type": "function_call",
+                        "id": acc.get("fc_id", ""),
+                        "call_id": acc["id"],
+                        "name": acc["name"],
+                        "arguments": acc["arguments"],
+                    },
+                },
+            )
+        )
+
+    output_items = []
+    if state.text_accumulator:
+        output_items.append(
+            {
+                "type": "message",
+                "id": state.msg_id,
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": state.text_accumulator}],
+            }
+        )
+    for idx, acc in sorted(state.tool_call_accumulators.items()):
+        output_items.append(
+            {
+                "type": "function_call",
+                "id": acc.get("fc_id", ""),
+                "call_id": acc["id"],
+                "name": acc["name"],
+                "arguments": acc["arguments"],
+            }
+        )
+
+    finish_reason = chunk.choices[0].finish_reason if chunk.choices else "stop"
+    status = "completed" if finish_reason in ("stop", "tool_calls") else "incomplete"
+
+    usage_data = None
+    if chunk.usage:
+        usage_data = {
+            "input_tokens": chunk.usage.prompt_tokens,
+            "output_tokens": chunk.usage.completion_tokens,
+            "total_tokens": chunk.usage.total_tokens,
+        }
+
+    lines.append(
+        _sse_line(
+            "response.completed",
+            {
+                "id": state.response_id,
+                "object": "response",
+                "model": state.model,
+                "status": status,
+                "output": output_items,
+                "usage": usage_data,
+            },
+        )
+    )
+
+    return lines
+
+
+async def stream_transform_iter(
+    chunk_iter,
+    response_id: str,
+    model: str | None = None,
+):
+    state = StreamState(response_id, model)
+
+    async for raw_line in chunk_iter:
+        line = (
+            raw_line.strip()
+            if isinstance(raw_line, str)
+            else raw_line.decode("utf-8").strip()
+        )
+        if not line or not line.startswith("data: "):
+            continue
+        data = line[6:]
+        if data == "[DONE]":
+            if not state.finished:
+                synthetic = ChatCompletionStreamChunk(
+                    id=response_id,
+                    choices=[],
+                )
+                for event_line in emit_done_events(state, synthetic):
+                    yield event_line
+            break
+
+        try:
+            chunk_data = json.loads(data)
+            chunk = ChatCompletionStreamChunk(**chunk_data)
+        except (json.JSONDecodeError, Exception):
+            continue
+
+        for event_line in process_chunk(chunk, state):
+            yield event_line
+
+    yield "event: response.done\ndata: {}\n\n"
+
+
+def _sse_line(event_type: str, data: dict[str, Any]) -> str:
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
