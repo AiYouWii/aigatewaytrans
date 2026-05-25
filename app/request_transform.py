@@ -19,21 +19,37 @@ def transform_request(
     request: ResponsesAPIRequest,
     previous_messages: list[ChatMessage] | None = None,
 ) -> ChatCompletionRequest:
-    messages = []
-
-    if previous_messages:
-        messages.extend(previous_messages)
+    raw_messages = []
 
     if request.instructions:
-        messages.append(ChatMessage(role="system", content=request.instructions))
+        raw_messages.append(ChatMessage(role="system", content=request.instructions))
+
+    if previous_messages:
+        raw_messages.extend(previous_messages)
 
     if isinstance(request.input, str):
-        messages.append(ChatMessage(role="user", content=request.input))
+        raw_messages.append(ChatMessage(role="user", content=request.input))
     elif isinstance(request.input, list):
         for item in request.input:
             msg = _transform_input_item(item)
             if msg:
-                messages.append(msg)
+                raw_messages.append(msg)
+
+    # vLLM requires a single system message at the beginning.
+    # Merge all system-role messages into one, then keep non-system messages in order.
+    system_parts: list[str] = []
+    non_system: list[ChatMessage] = []
+    for m in raw_messages:
+        if m.role == "system":
+            if m.content:
+                system_parts.append(m.content)
+        else:
+            non_system.append(m)
+
+    messages: list[ChatMessage] = []
+    if system_parts:
+        messages.append(ChatMessage(role="system", content="\n\n".join(system_parts)))
+    messages.extend(non_system)
 
     tools = _transform_tools(request.tools)
 
@@ -119,7 +135,7 @@ def _transform_message(msg: ResponseInputMessage) -> ChatMessage:
         parts = []
         for part in msg.content:
             if isinstance(part, dict):
-                if part.get("type") == "input_text":
+                if part.get("type") in ("input_text", "output_text"):
                     parts.append(part.get("text", ""))
                 elif part.get("type") == "input_image":
                     parts.append(part.get("image_url", ""))

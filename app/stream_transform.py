@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 import uuid
 from typing import Any
 
 from app.models import ChatCompletionStreamChunk
+
+logger = logging.getLogger("aigateway")
 
 
 class StreamState:
@@ -19,6 +23,7 @@ class StreamState:
         self.text_started = False
         self.initial_events_emitted = False
         self.finished = False
+        self.created_at = int(time.time())
 
 
 def emit_initial_events(state: StreamState) -> list[str]:
@@ -31,11 +36,14 @@ def emit_initial_events(state: StreamState) -> list[str]:
         _sse_line(
             "response.created",
             {
-                "id": state.response_id,
-                "object": "response",
-                "model": state.model,
-                "status": "in_progress",
-                "output": [],
+                "response": {
+                    "id": state.response_id,
+                    "object": "response",
+                    "model": state.model,
+                    "status": "in_progress",
+                    "output": [],
+                    "created_at": state.created_at,
+                },
             },
         )
     )
@@ -240,6 +248,7 @@ def emit_done_events(state: StreamState, chunk: ChatCompletionStreamChunk) -> li
 
     finish_reason = chunk.choices[0].finish_reason if chunk.choices else "stop"
     status = "completed" if finish_reason in ("stop", "tool_calls") else "incomplete"
+    end_turn = finish_reason == "stop"
 
     usage_data = None
     if chunk.usage:
@@ -253,12 +262,16 @@ def emit_done_events(state: StreamState, chunk: ChatCompletionStreamChunk) -> li
         _sse_line(
             "response.completed",
             {
-                "id": state.response_id,
-                "object": "response",
-                "model": state.model,
-                "status": status,
-                "output": output_items,
-                "usage": usage_data,
+                "response": {
+                    "id": state.response_id,
+                    "object": "response",
+                    "model": state.model,
+                    "status": status,
+                    "output": output_items,
+                    "usage": usage_data,
+                    "created_at": state.created_at,
+                    "end_turn": end_turn,
+                },
             },
         )
     )
@@ -272,37 +285,71 @@ async def stream_transform_iter(
     model: str | None = None,
 ):
     state = StreamState(response_id, model)
+    raw_line_count = 0
+    chunk_count = 0
 
-    async for raw_line in chunk_iter:
-        line = (
-            raw_line.strip()
-            if isinstance(raw_line, str)
-            else raw_line.decode("utf-8").strip()
-        )
-        if not line or not line.startswith("data: "):
-            continue
-        data = line[6:]
-        if data == "[DONE]":
-            if not state.finished:
-                synthetic = ChatCompletionStreamChunk(
-                    id=response_id,
-                    choices=[],
+    try:
+        async for raw_line in chunk_iter:
+            raw_line_count += 1
+            line = (
+                raw_line.strip()
+                if isinstance(raw_line, str)
+                else raw_line.decode("utf-8").strip()
+            )
+            if not line or not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                logger.info(
+                    "Stream transform: [DONE] received after %d raw lines, %d chunks",
+                    raw_line_count,
+                    chunk_count,
                 )
-                for event_line in emit_done_events(state, synthetic):
-                    yield event_line
-            break
+                break
 
-        try:
-            chunk_data = json.loads(data)
-            chunk = ChatCompletionStreamChunk(**chunk_data)
-        except (json.JSONDecodeError, Exception):
-            continue
+            try:
+                chunk_data = json.loads(data)
+                chunk = ChatCompletionStreamChunk(**chunk_data)
+                chunk_count += 1
+            except json.JSONDecodeError:
+                logger.warning("Skipping non-JSON SSE line: %s", data[:200])
+                continue
+            except Exception as exc:
+                logger.warning("Skipping unparseable chunk: %s", exc)
+                continue
 
-        for event_line in process_chunk(chunk, state):
+            for event_line in process_chunk(chunk, state):
+                yield event_line
+    except Exception as exc:
+        logger.error("Stream iterator error: %s", exc)
+        yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+
+    # Guarantee response.completed is always emitted, even if stream
+    # ended without [DONE] or finish_reason.
+    if not state.finished:
+        logger.warning(
+            "Stream ended without finish_reason; emitting synthetic completion "
+            "(raw_lines=%d, chunks=%d)",
+            raw_line_count,
+            chunk_count,
+        )
+        synthetic = ChatCompletionStreamChunk(id=response_id, choices=[])
+        for event_line in emit_done_events(state, synthetic):
             yield event_line
 
-    yield "event: response.done\ndata: {}\n\n"
+    logger.info(
+        "Stream transform complete: response.completed emitted, "
+        "raw_lines=%d, chunks=%d, text_len=%d",
+        raw_line_count,
+        chunk_count,
+        len(state.text_accumulator),
+    )
+
+    yield "event: response.done\ndata: {\"type\": \"response.done\"}\n\n"
 
 
 def _sse_line(event_type: str, data: dict[str, Any]) -> str:
-    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+    # Codex CLI requires a "type" field in each SSE data payload
+    # for serde deserialization.  It must match the event type string.
+    payload = {**data, "type": event_type}
+    return f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"

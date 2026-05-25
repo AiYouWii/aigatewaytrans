@@ -104,8 +104,29 @@ async def _stream_response(chat_request, response_id: str, model: str):
         async for event in stream_transform_iter(line_iter, response_id, model):
             yield event
     except Exception as e:
-        logger.error(f"Stream error: {e}")
+        logger.error("Stream error: %s", e)
         yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+        # Emit a completed event so the client doesn't hang waiting for it.
+        yield _sse_line(
+            "response.completed",
+            {
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "model": model,
+                    "status": "failed",
+                    "output": [],
+                    "error": str(e),
+                },
+            },
+        )
+        yield 'event: response.done\ndata: {"type": "response.done"}\n\n'
+
+
+def _sse_line(event_type: str, data: dict) -> str:
+    # Codex CLI requires a "type" field in each SSE data payload for serde.
+    payload = {**data, "type": event_type}
+    return f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
 
 
 @app.on_event("shutdown")
