@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import httpx
 import json
 import logging
 import uuid
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from app.config import settings
 from app.conversation_store import store
@@ -132,6 +133,54 @@ def _sse_line(event_type: str, data: dict) -> str:
 @app.on_event("shutdown")
 async def shutdown():
     await vllm_client.close()
+
+
+# ─── Catch-all proxy: forward unmatched requests to vLLM ───
+
+_PROXY_SKIP_HEADERS = {"content-encoding", "content-length", "transfer-encoding", "connection"}
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+async def proxy_to_vllm(request: Request, path: str):
+    vllm_path = f"/{path}"
+    logger.debug("Proxying %s %s → vLLM", request.method, vllm_path)
+
+    # Strip hop-by-hop headers that must not be forwarded.
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in _PROXY_SKIP_HEADERS
+    }
+    body = await request.body()
+
+    resp = await vllm_client.proxy(request.method, vllm_path, headers, body)
+
+    # Build response headers, stripping hop-by-hop headers.
+    resp_headers = {}
+    for key, value in resp.headers.items():
+        if key.lower() not in _PROXY_SKIP_HEADERS:
+            resp_headers[key] = value
+
+    # SSE streams: relay the raw bytes without buffering.
+    if resp_headers.get("content-type", "").startswith("text/event-stream"):
+        return StreamingResponse(
+            _relay_stream(resp),
+            status_code=resp.status_code,
+            headers=resp_headers,
+            media_type="text/event-stream",
+        )
+
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers=resp_headers,
+        media_type=resp_headers.get("content-type"),
+    )
+
+
+async def _relay_stream(resp: httpx.Response):
+    async for chunk in resp.aiter_bytes():
+        yield chunk
 
 
 if __name__ == "__main__":
