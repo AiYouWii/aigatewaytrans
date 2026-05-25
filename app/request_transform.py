@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+
+from app.config import settings
 from app.models import (
     ChatCompletionRequest,
     ChatFunctionTool,
@@ -14,6 +17,14 @@ from app.models import (
     ResponseInputMessage,
 )
 
+logger = logging.getLogger("aigateway")
+
+_TOOL_CONTINUATION_HINT = (
+    "IMPORTANT: When tools are available, you must continue executing them "
+    "step by step until all requested changes are fully completed. Do NOT "
+    "stop early to provide a summary. Only output a final text response "
+    "after every modification has been applied."
+)
 
 _TOOL_RESULT_HINT = (
     "\n\n[Continue with the next tool call if more work remains "
@@ -21,14 +32,86 @@ _TOOL_RESULT_HINT = (
 )
 
 
+def _trim_context(messages: list[ChatMessage], max_non_system: int) -> list[ChatMessage]:
+    """Trim long conversations to keep the model focused.
+
+    Keeps: system message + first user message + most recent messages.
+    Drops older middle messages that are no longer essential.
+    Ensures the trimmed conversation starts at a valid boundary
+    (a user message, or an assistant message with tool_calls before a tool message).
+    """
+    if len(messages) <= max_non_system + 1:  # +1 for system
+        return messages
+
+    system = [m for m in messages if m.role == "system"]
+    non_system = [m for m in messages if m.role != "system"]
+
+    if len(non_system) <= max_non_system:
+        return messages
+
+    # Keep the first user message (original task description)
+    first_user = None
+    rest_start = 0
+    for i, m in enumerate(non_system):
+        if m.role == "user":
+            first_user = m
+            rest_start = i + 1
+            break
+
+    rest = non_system[rest_start:]
+
+    # From the rest, keep the most recent messages up to our budget
+    budget = max_non_system - (1 if first_user else 0)
+
+    # Walk forward from the cut point to find a valid conversation boundary:
+    # - a user message (start of a new turn)
+    # - an assistant message with tool_calls (preceding a tool message)
+    # This ensures tool messages always have a matching assistant message.
+    cut = len(rest) - budget
+    for i in range(max(cut, 0), len(rest)):
+        m = rest[i]
+        if m.role == "user":
+            cut = i
+            break
+        if m.role == "assistant" and m.tool_calls:
+            cut = i
+            break
+
+    recent = rest[cut:]
+
+    dropped = len(rest) - len(recent)
+    logger.info(
+        "Context trimmed: %d non-system messages → %d (dropped %d older messages)",
+        len(non_system),
+        max_non_system,
+        dropped,
+    )
+
+    result = system
+    if first_user:
+        result.append(first_user)
+    result.extend(recent)
+    return result
+
+
 def transform_request(
     request: ResponsesAPIRequest,
     previous_messages: list[ChatMessage] | None = None,
+    max_output_tokens_default: int | None = None,
+    max_context_messages_limit: int | None = None,
 ) -> ChatCompletionRequest:
     raw_messages = []
 
     if request.instructions:
         raw_messages.append(ChatMessage(role="system", content=request.instructions))
+
+    # Inject continuation instructions when tools are available, to prevent
+    # the model from stopping early with a summary instead of making tool calls.
+    # Since system messages are filtered from saved conversations (not duplicated),
+    # this hint is only injected once per turn.
+    has_tools = request.tools is not None and len(request.tools) > 0
+    if has_tools:
+        raw_messages.append(ChatMessage(role="system", content=_TOOL_CONTINUATION_HINT))
 
     if previous_messages:
         raw_messages.extend(previous_messages)
@@ -42,8 +125,6 @@ def transform_request(
             if msg.role == "assistant" and msg.tool_calls:
                 for tc in msg.tool_calls:
                     existing_call_ids.add(tc.id)
-
-    has_tools = request.tools is not None and len(request.tools) > 0
 
     if isinstance(request.input, str):
         raw_messages.append(ChatMessage(role="user", content=request.input))
@@ -69,6 +150,9 @@ def transform_request(
         messages.append(ChatMessage(role="system", content="\n\n".join(system_parts)))
     messages.extend(non_system)
 
+    # Trim long context to prevent the model from getting confused
+    messages = _trim_context(messages, max_context_messages_limit or settings.fallback_max_context_messages)
+
     tools = _transform_tools(request.tools)
 
     response_format = None
@@ -85,6 +169,19 @@ def transform_request(
     if request.reasoning and request.reasoning.effort:
         reasoning_effort = request.reasoning.effort
 
+    # Use dynamic max_output_tokens when client doesn't specify one,
+    # giving the model enough room for full tool-call responses.
+    max_tokens = request.max_output_tokens or (max_output_tokens_default or settings.fallback_max_output_tokens)
+
+    logger.info(
+        "Transformed request: model=%s, msg_count=%d, has_tools=%s, stream=%s, max_tokens=%s",
+        request.model,
+        len(messages),
+        tools is not None,
+        request.stream,
+        max_tokens,
+    )
+
     return ChatCompletionRequest(
         model=request.model,
         messages=messages,
@@ -92,7 +189,7 @@ def transform_request(
         stream=request.stream,
         temperature=request.temperature,
         top_p=request.top_p,
-        max_tokens=request.max_output_tokens,
+        max_tokens=max_tokens,
         response_format=response_format,
         reasoning_effort=reasoning_effort,
     )

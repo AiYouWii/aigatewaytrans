@@ -19,6 +19,7 @@ _UNSUPPORTED_PARAMS = {"reasoning_effort", "extra_body"}
 class VLLMClient:
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
+        self._model_configs: dict[str, dict[str, Any]] = {}
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -111,6 +112,58 @@ class VLLMClient:
         resp.raise_for_status()
         data = resp.json()
         return data.get("data", [])
+
+    async def get_model_config(self, model_name: str) -> dict[str, Any]:
+        """Fetch and cache model configuration from vLLM, including max_model_len."""
+        if model_name in self._model_configs:
+            return self._model_configs[model_name]
+
+        try:
+            models = await self.models()
+        except Exception as exc:
+            logger.warning("Cannot fetch vLLM model list: %s", exc)
+            return {}
+
+        # Exact match first
+        for m in models:
+            if m.get("id") == model_name:
+                config = {"max_model_len": m.get("max_model_len")}
+                self._model_configs[model_name] = config
+                logger.info(
+                    "Cached model config for '%s': max_model_len=%s",
+                    model_name,
+                    config.get("max_model_len"),
+                )
+                return config
+
+        # Case-insensitive match
+        for m in models:
+            if m.get("id", "").lower() == model_name.lower():
+                config = {"max_model_len": m.get("max_model_len")}
+                self._model_configs[model_name] = config
+                logger.info(
+                    "Cached model config for '%s' (matched '%s'): max_model_len=%s",
+                    model_name,
+                    m.get("id"),
+                    config.get("max_model_len"),
+                )
+                return config
+
+        # If only one model, use it regardless of name
+        if len(models) == 1:
+            config = {"max_model_len": models[0].get("max_model_len")}
+            self._model_configs[model_name] = config
+            logger.info(
+                "Cached model config for '%s' (single model '%s'): max_model_len=%s",
+                model_name,
+                models[0].get("id"),
+                config.get("max_model_len"),
+            )
+            return config
+
+        # No matching model found
+        logger.warning("Model '%s' not found in vLLM model list", model_name)
+        return {}
 
     async def close(self) -> None:
         if self._client and not self._client.is_closed:
