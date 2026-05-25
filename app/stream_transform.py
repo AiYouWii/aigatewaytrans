@@ -380,17 +380,23 @@ async def stream_transform_iter(
     yield "event: response.done\ndata: {\"type\": \"response.done\"}\n\n"
 
     # Save conversation so follow-up requests with previous_response_id
-    # can retrieve the full message history including this response.
+    # can retrieve the message history.  System messages are NOT saved —
+    # they are reconstructed from the current request each turn, which
+    # prevents duplicate accumulation that causes the model to summarize
+    # prematurely instead of continuing tool execution.
     if messages is not None:
         from app.conversation_store import store
 
+        non_system = [m for m in messages if m.role != "system"]
         assistant_msg = _build_assistant_message(state)
-        full_messages = messages + [assistant_msg]
-        store.save(response_id, full_messages)
+        saved = non_system + [assistant_msg]
+        store.save(response_id, saved)
         logger.info(
-            "Saved conversation for response_id=%s, msg_count=%d, has_tool_calls=%s",
+            "Saved conversation for response_id=%s, msg_count=%d (saved=%d, system_filtered=%d), has_tool_calls=%s",
             response_id,
-            len(full_messages),
+            len(messages),
+            len(saved),
+            len(messages) - len(non_system),
             bool(state.tool_call_accumulators),
         )
 

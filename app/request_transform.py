@@ -15,14 +15,6 @@ from app.models import (
 )
 
 
-_TOOL_CONTINUATION_HINT = (
-    "IMPORTANT: You must continue executing tools step by step until all "
-    "requested changes are fully completed. Do NOT stop early to provide "
-    "a summary or conclusion. Only output a final response after every "
-    "modification has been applied. If there are more steps to complete "
-    "the task, call the appropriate tool instead of summarizing."
-)
-
 _TOOL_RESULT_HINT = (
     "\n\n[Continue with the next tool call if more work remains "
     "to complete the task. Do not provide a summary prematurely.]"
@@ -38,12 +30,6 @@ def transform_request(
     if request.instructions:
         raw_messages.append(ChatMessage(role="system", content=request.instructions))
 
-    # Inject continuation instructions when tools are available to prevent
-    # the model from stopping early with a summary instead of making tool calls.
-    has_tools = request.tools is not None and len(request.tools) > 0
-    if has_tools:
-        raw_messages.append(ChatMessage(role="system", content=_TOOL_CONTINUATION_HINT))
-
     if previous_messages:
         raw_messages.extend(previous_messages)
 
@@ -56,6 +42,8 @@ def transform_request(
             if msg.role == "assistant" and msg.tool_calls:
                 for tc in msg.tool_calls:
                     existing_call_ids.add(tc.id)
+
+    has_tools = request.tools is not None and len(request.tools) > 0
 
     if isinstance(request.input, str):
         raw_messages.append(ChatMessage(role="user", content=request.input))

@@ -145,8 +145,10 @@ async def create_response(request: Request):
     chat_response = await vllm_client.complete(chat_request)
     responses_response = transform_response(chat_response)
 
-    # Store conversation
-    store.save(responses_response.id, chat_request.messages)
+    # Store conversation — exclude system messages to prevent
+    # duplicate accumulation on follow-up turns.
+    non_system = [m for m in chat_request.messages if m.role != "system"]
+    store.save(responses_response.id, non_system)
 
     return JSONResponse(content=responses_response.model_dump(exclude_none=True))
 
