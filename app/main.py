@@ -121,7 +121,9 @@ async def create_response(request: Request):
             len(resp_request.input) if isinstance(resp_request.input, list) else 1,
         )
 
-    # Fetch model config from vLLM to dynamically adapt parameters
+    # Use max_output_tokens from the client if set; otherwise use the
+    # dynamically computed default (from vLLM's max_model_len) to ensure
+    # the model has enough room for full tool-call responses.
     max_model_len = None
     try:
         model_config = await vllm_client.get_model_config(resp_request.model)
@@ -129,22 +131,15 @@ async def create_response(request: Request):
     except Exception:
         logger.warning("Cannot fetch model config, using fallback defaults")
 
-    # Compute dynamic limits based on model's actual context window:
-    # - max_output_tokens: reserve ~25% of context for model output
-    # - max_context_messages: estimate ~400 tokens per message,
-    #   subtract output budget from total context
     if max_model_len:
         dyn_max_output_tokens = min(max_model_len // 4, settings.fallback_max_output_tokens)
-        dyn_max_context = min(max(max_model_len - dyn_max_output_tokens, 8000) // 400, 100)
     else:
         dyn_max_output_tokens = settings.fallback_max_output_tokens
-        dyn_max_context = settings.fallback_max_context_messages
 
     chat_request = transform_request(
         resp_request,
         previous_messages,
         max_output_tokens_default=dyn_max_output_tokens,
-        max_context_messages_limit=dyn_max_context,
     )
 
     if resp_request.stream:

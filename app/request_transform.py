@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 
-from app.config import settings
 from app.models import (
     ChatCompletionRequest,
     ChatFunctionTool,
@@ -19,118 +18,45 @@ from app.models import (
 
 logger = logging.getLogger("aigateway")
 
-_TOOL_CONTINUATION_HINT = (
-    "IMPORTANT: When tools are available, you must continue executing them "
-    "step by step until all requested changes are fully completed. Do NOT "
-    "stop early to provide a summary. Only output a final text response "
-    "after every modification has been applied."
-)
-
-_TOOL_RESULT_HINT = (
-    "\n\n[Continue with the next tool call if more work remains "
-    "to complete the task. Do not provide a summary prematurely.]"
-)
-
-
-def _trim_context(messages: list[ChatMessage], max_non_system: int) -> list[ChatMessage]:
-    """Trim long conversations to keep the model focused.
-
-    Keeps: system message + first user message + most recent messages.
-    Drops older middle messages that are no longer essential.
-    Ensures the trimmed conversation starts at a valid boundary
-    (a user message, or an assistant message with tool_calls before a tool message).
-    """
-    if len(messages) <= max_non_system + 1:  # +1 for system
-        return messages
-
-    system = [m for m in messages if m.role == "system"]
-    non_system = [m for m in messages if m.role != "system"]
-
-    if len(non_system) <= max_non_system:
-        return messages
-
-    # Keep the first user message (original task description)
-    first_user = None
-    rest_start = 0
-    for i, m in enumerate(non_system):
-        if m.role == "user":
-            first_user = m
-            rest_start = i + 1
-            break
-
-    rest = non_system[rest_start:]
-
-    # From the rest, keep the most recent messages up to our budget
-    budget = max_non_system - (1 if first_user else 0)
-
-    # Walk forward from the cut point to find a valid conversation boundary:
-    # - a user message (start of a new turn)
-    # - an assistant message with tool_calls (preceding a tool message)
-    # This ensures tool messages always have a matching assistant message.
-    cut = len(rest) - budget
-    for i in range(max(cut, 0), len(rest)):
-        m = rest[i]
-        if m.role == "user":
-            cut = i
-            break
-        if m.role == "assistant" and m.tool_calls:
-            cut = i
-            break
-
-    recent = rest[cut:]
-
-    dropped = len(rest) - len(recent)
-    logger.info(
-        "Context trimmed: %d non-system messages → %d (dropped %d older messages)",
-        len(non_system),
-        max_non_system,
-        dropped,
-    )
-
-    result = system
-    if first_user:
-        result.append(first_user)
-    result.extend(recent)
-    return result
-
 
 def transform_request(
     request: ResponsesAPIRequest,
     previous_messages: list[ChatMessage] | None = None,
     max_output_tokens_default: int | None = None,
-    max_context_messages_limit: int | None = None,
 ) -> ChatCompletionRequest:
     raw_messages = []
 
     if request.instructions:
         raw_messages.append(ChatMessage(role="system", content=request.instructions))
 
-    # Inject continuation instructions when tools are available, to prevent
-    # the model from stopping early with a summary instead of making tool calls.
-    # Since system messages are filtered from saved conversations (not duplicated),
-    # this hint is only injected once per turn.
-    has_tools = request.tools is not None and len(request.tools) > 0
-    if has_tools:
-        raw_messages.append(ChatMessage(role="system", content=_TOOL_CONTINUATION_HINT))
-
     if previous_messages:
         raw_messages.extend(previous_messages)
 
-    # Collect existing call_ids from previous_messages to avoid
-    # duplicate assistant messages when Codex re-includes function_call
-    # items that are already in the conversation history.
+    # Build call_id → function name mapping from conversation history.
+    # This lets us add the `name` field to tool role messages, which is
+    # how OpenAI formats them — giving the model better context about
+    # which function produced each result.
     existing_call_ids: set[str] = set()
+    call_id_to_name: dict[str, str] = {}
     if previous_messages:
         for msg in previous_messages:
             if msg.role == "assistant" and msg.tool_calls:
                 for tc in msg.tool_calls:
                     existing_call_ids.add(tc.id)
+                    call_id_to_name[tc.id] = tc.function.name
+
+    # Also collect call_id → name from function_call items in the
+    # current input, so tool results that follow get the name too.
+    if isinstance(request.input, list):
+        for item in request.input:
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                call_id_to_name[item.get("call_id", "")] = item.get("name", "")
 
     if isinstance(request.input, str):
         raw_messages.append(ChatMessage(role="user", content=request.input))
     elif isinstance(request.input, list):
         for item in request.input:
-            msg = _transform_input_item(item, existing_call_ids, has_tools)
+            msg = _transform_input_item(item, existing_call_ids, call_id_to_name)
             if msg:
                 raw_messages.append(msg)
 
@@ -150,10 +76,30 @@ def transform_request(
         messages.append(ChatMessage(role="system", content="\n\n".join(system_parts)))
     messages.extend(non_system)
 
-    # Trim long context to prevent the model from getting confused
-    messages = _trim_context(messages, max_context_messages_limit or settings.fallback_max_context_messages)
-
     tools = _transform_tools(request.tools)
+
+    # Translate tool_choice from Responses API format to Chat Completions format.
+    # Responses API uses {"type": "function", "name": "func_name"}
+    # Chat Completions uses {"type": "function", "function": {"name": "func_name"}}
+    # OpenAI defaults to tool_choice="auto" when tools are present.
+    tool_choice = None
+    if request.tool_choice:
+        if isinstance(request.tool_choice, str):
+            tool_choice = request.tool_choice
+        elif isinstance(request.tool_choice, dict):
+            if request.tool_choice.get("type") == "function":
+                tool_choice = {
+                    "type": "function",
+                    "function": {"name": request.tool_choice.get("name")},
+                }
+            else:
+                tool_choice = request.tool_choice
+    elif tools:
+        tool_choice = "auto"
+
+    parallel_tool_calls = request.parallel_tool_calls
+    if parallel_tool_calls is None and tools:
+        parallel_tool_calls = True
 
     response_format = None
     if request.text and request.text.type != "text":
@@ -169,15 +115,18 @@ def transform_request(
     if request.reasoning and request.reasoning.effort:
         reasoning_effort = request.reasoning.effort
 
-    # Use dynamic max_output_tokens when client doesn't specify one,
-    # giving the model enough room for full tool-call responses.
-    max_tokens = request.max_output_tokens or (max_output_tokens_default or settings.fallback_max_output_tokens)
+    # Use max_output_tokens from the client if set; otherwise use the
+    # dynamically computed default (from vLLM's max_model_len) to ensure
+    # the model has enough room for full tool-call responses.
+    max_tokens = request.max_output_tokens or max_output_tokens_default
 
     logger.info(
-        "Transformed request: model=%s, msg_count=%d, has_tools=%s, stream=%s, max_tokens=%s",
+        "Transformed request: model=%s, msg_count=%d, has_tools=%s, tool_choice=%s, parallel_tool_calls=%s, stream=%s, max_tokens=%s",
         request.model,
         len(messages),
         tools is not None,
+        tool_choice,
+        parallel_tool_calls,
         request.stream,
         max_tokens,
     )
@@ -186,6 +135,8 @@ def transform_request(
         model=request.model,
         messages=messages,
         tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
         stream=request.stream,
         temperature=request.temperature,
         top_p=request.top_p,
@@ -198,7 +149,7 @@ def transform_request(
 def _transform_input_item(
     item: dict | object,
     existing_call_ids: set[str] | None = None,
-    has_tools: bool = False,
+    call_id_to_name: dict[str, str] | None = None,
 ) -> ChatMessage | None:
     if isinstance(item, dict):
         item_type = item.get("type")
@@ -217,15 +168,15 @@ def _transform_input_item(
             result = FunctionCallResult(**item)
         else:
             result = item
-        content = result.output
-        # Append continuation hint to tool results when tools are available,
-        # nudging the model to keep executing instead of summarizing prematurely.
-        if has_tools:
-            content += _TOOL_RESULT_HINT
+        # Include `name` in tool messages — this is how OpenAI formats them
+        # and helps the model understand which function the result belongs to.
+        # Do NOT modify the content (no hints appended) — faithful translation.
+        name = call_id_to_name.get(result.call_id) if call_id_to_name else None
         return ChatMessage(
             role="tool",
             tool_call_id=result.call_id,
-            content=content,
+            content=result.output,
+            name=name,
         )
 
     if item_type == "function_call":
@@ -307,6 +258,7 @@ def _transform_tools(
                             "name": tool.get("name"),
                             "description": tool.get("description"),
                             "parameters": tool.get("parameters"),
+                            "strict": tool.get("strict"),
                         },
                     )
                 )
@@ -320,6 +272,7 @@ def _transform_tools(
                         "name": tool.name,
                         "description": tool.description,
                         "parameters": tool.parameters,
+                        "strict": tool.strict,
                     },
                 )
             )

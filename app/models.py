@@ -73,6 +73,8 @@ class ResponsesAPIRequest(BaseModel):
     input: str | list[ResponseInputItem] = Field(default_factory=list)
     instructions: str | None = None
     tools: list[FunctionTool | Any] | None = None
+    tool_choice: str | dict | None = None
+    parallel_tool_calls: bool | None = None
     stream: bool = False
     temperature: float | None = None
     top_p: float | None = None
@@ -114,6 +116,8 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
     tools: list[ChatFunctionTool] | None = None
+    tool_choice: str | dict | None = None
+    parallel_tool_calls: bool | None = None
     stream: bool = False
     temperature: float | None = None
     top_p: float | None = None
