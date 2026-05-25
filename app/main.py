@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 
 from fastapi import FastAPI, Request
@@ -78,8 +79,22 @@ async def create_response(request: Request):
                     "error": f"previous_response_id '{resp_request.previous_response_id}' not found"
                 },
             )
+        logger.info(
+            "Continuing conversation: previous_response_id=%s, "
+            "prev_msg_count=%d, new_input_items=%d",
+            resp_request.previous_response_id,
+            len(previous_messages),
+            len(resp_request.input) if isinstance(resp_request.input, list) else 1,
+        )
 
     chat_request = transform_request(resp_request, previous_messages)
+    logger.info(
+        "Transformed request: model=%s, msg_count=%d, has_tools=%s, stream=%s",
+        chat_request.model,
+        len(chat_request.messages),
+        chat_request.tools is not None,
+        chat_request.stream,
+    )
 
     if resp_request.stream:
         response_id = f"resp_{uuid.uuid4().hex[:24]}"
@@ -88,6 +103,7 @@ async def create_response(request: Request):
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
             },
         )
@@ -102,11 +118,17 @@ async def create_response(request: Request):
 
 
 async def _stream_response(chat_request, response_id: str, model: str):
+    logger.info("Stream response started: response_id=%s, model=%s", response_id, model)
+    created_at = int(time.time())
+    event_count = 0
     try:
         line_iter = vllm_client.stream(chat_request)
         async for event in stream_transform_iter(
             line_iter, response_id, model, chat_request.messages
         ):
+            event_count += 1
+            if event_count <= 5 or event_count % 20 == 0:
+                logger.debug("Stream event #%d: %s", event_count, event[:120] if isinstance(event, str) else str(event)[:120])
             yield event
     except Exception as e:
         logger.error("Stream error: %s", e)
@@ -125,6 +147,7 @@ async def _stream_response(chat_request, response_id: str, model: str):
                         "output_tokens": 0,
                         "total_tokens": 0,
                     },
+                    "created_at": created_at,
                     "end_turn": False,
                 },
             },

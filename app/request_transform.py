@@ -27,11 +27,21 @@ def transform_request(
     if previous_messages:
         raw_messages.extend(previous_messages)
 
+    # Collect existing call_ids from previous_messages to avoid
+    # duplicate assistant messages when Codex re-includes function_call
+    # items that are already in the conversation history.
+    existing_call_ids: set[str] = set()
+    if previous_messages:
+        for msg in previous_messages:
+            if msg.role == "assistant" and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    existing_call_ids.add(tc.id)
+
     if isinstance(request.input, str):
         raw_messages.append(ChatMessage(role="user", content=request.input))
     elif isinstance(request.input, list):
         for item in request.input:
-            msg = _transform_input_item(item)
+            msg = _transform_input_item(item, existing_call_ids)
             if msg:
                 raw_messages.append(msg)
 
@@ -80,7 +90,10 @@ def transform_request(
     )
 
 
-def _transform_input_item(item: dict | object) -> ChatMessage | None:
+def _transform_input_item(
+    item: dict | object,
+    existing_call_ids: set[str] | None = None,
+) -> ChatMessage | None:
     if isinstance(item, dict):
         item_type = item.get("type")
     else:
@@ -109,6 +122,9 @@ def _transform_input_item(item: dict | object) -> ChatMessage | None:
             call = FunctionCallInput(**item)
         else:
             call = item
+        # Skip duplicate function_calls already present in previous_messages
+        if existing_call_ids and call.call_id in existing_call_ids:
+            return None
         return ChatMessage(
             role="assistant",
             content=None,

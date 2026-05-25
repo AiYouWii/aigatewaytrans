@@ -18,12 +18,15 @@ class StreamState:
         self.msg_id = f"msg_{uuid.uuid4().hex[:24]}"
         self.text_accumulator = ""
         self.tool_call_accumulators: dict[int, dict[str, str]] = {}
-        self.output_item_started = False
-        self.content_part_started = False
+        self.message_item_started = False
         self.text_started = False
         self.initial_events_emitted = False
         self.finished = False
         self.created_at = int(time.time())
+
+    @property
+    def message_offset(self) -> int:
+        return 1 if self.message_item_started else 0
 
 
 def emit_initial_events(state: StreamState) -> list[str]:
@@ -31,8 +34,7 @@ def emit_initial_events(state: StreamState) -> list[str]:
         return []
     state.initial_events_emitted = True
 
-    lines = []
-    lines.append(
+    return [
         _sse_line(
             "response.created",
             {
@@ -51,10 +53,15 @@ def emit_initial_events(state: StreamState) -> list[str]:
                 },
             },
         )
-    )
+    ]
 
-    state.output_item_started = True
-    lines.append(
+
+def _emit_message_start(state: StreamState) -> list[str]:
+    if state.message_item_started:
+        return []
+    state.message_item_started = True
+
+    return [
         _sse_line(
             "response.output_item.added",
             {
@@ -66,11 +73,7 @@ def emit_initial_events(state: StreamState) -> list[str]:
                     "content": [],
                 },
             },
-        )
-    )
-
-    state.content_part_started = True
-    lines.append(
+        ),
         _sse_line(
             "response.content_part.added",
             {
@@ -78,10 +81,8 @@ def emit_initial_events(state: StreamState) -> list[str]:
                 "content_index": 0,
                 "part": {"type": "output_text", "text": ""},
             },
-        )
-    )
-
-    return lines
+        ),
+    ]
 
 
 def process_chunk(chunk: ChatCompletionStreamChunk, state: StreamState) -> list[str]:
@@ -94,7 +95,9 @@ def process_chunk(chunk: ChatCompletionStreamChunk, state: StreamState) -> list[
     delta = choice.delta
 
     if delta.content:
-        state.text_started = True
+        if not state.text_started:
+            state.text_started = True
+            lines.extend(_emit_message_start(state))
         state.text_accumulator += delta.content
         lines.append(
             _sse_line(
@@ -111,23 +114,26 @@ def process_chunk(chunk: ChatCompletionStreamChunk, state: StreamState) -> list[
         for tc in delta.tool_calls:
             idx = tc.index
             if idx not in state.tool_call_accumulators:
+                call_id = tc.id or f"call_{uuid.uuid4().hex[:24]}"
                 state.tool_call_accumulators[idx] = {
-                    "id": tc.id or "",
+                    "id": call_id,
                     "name": tc.function.name or "",
                     "arguments": "",
                     "fc_id": f"fc_{uuid.uuid4().hex[:24]}",
                 }
+                output_index = idx + state.message_offset
                 lines.append(
                     _sse_line(
                         "response.output_item.added",
                         {
-                            "output_index": idx + 1,
+                            "output_index": output_index,
                             "item": {
                                 "type": "function_call",
                                 "id": state.tool_call_accumulators[idx]["fc_id"],
-                                "call_id": tc.id or "",
+                                "call_id": call_id,
                                 "name": tc.function.name or "",
                                 "arguments": "",
+                                "status": "in_progress",
                             },
                         },
                     )
@@ -137,11 +143,13 @@ def process_chunk(chunk: ChatCompletionStreamChunk, state: StreamState) -> list[
                 state.tool_call_accumulators[idx]["name"] = tc.function.name
             if tc.function.arguments:
                 state.tool_call_accumulators[idx]["arguments"] += tc.function.arguments
+                output_index = idx + state.message_offset
                 lines.append(
                     _sse_line(
                         "response.function_call_arguments.delta",
                         {
-                            "output_index": idx + 1,
+                            "output_index": output_index,
+                            "item_id": state.tool_call_accumulators[idx]["fc_id"],
                             "delta": tc.function.arguments,
                         },
                     )
@@ -160,32 +168,32 @@ def emit_done_events(state: StreamState, chunk: ChatCompletionStreamChunk) -> li
 
     lines = []
 
-    if state.text_started:
-        lines.append(
-            _sse_line(
-                "response.output_text.done",
-                {
-                    "output_index": 0,
-                    "content_index": 0,
-                    "text": state.text_accumulator,
-                },
-            )
-        )
-        lines.append(
-            _sse_line(
-                "response.content_part.done",
-                {
-                    "output_index": 0,
-                    "content_index": 0,
-                    "part": {
-                        "type": "output_text",
+    if state.message_item_started:
+        if state.text_started:
+            lines.append(
+                _sse_line(
+                    "response.output_text.done",
+                    {
+                        "output_index": 0,
+                        "content_index": 0,
                         "text": state.text_accumulator,
                     },
-                },
+                )
             )
-        )
+            lines.append(
+                _sse_line(
+                    "response.content_part.done",
+                    {
+                        "output_index": 0,
+                        "content_index": 0,
+                        "part": {
+                            "type": "output_text",
+                            "text": state.text_accumulator,
+                        },
+                    },
+                )
+            )
 
-    if state.output_item_started:
         content = []
         if state.text_accumulator:
             content.append({"type": "output_text", "text": state.text_accumulator})
@@ -205,11 +213,13 @@ def emit_done_events(state: StreamState, chunk: ChatCompletionStreamChunk) -> li
         )
 
     for idx, acc in sorted(state.tool_call_accumulators.items()):
+        output_index = idx + state.message_offset
         lines.append(
             _sse_line(
                 "response.function_call_arguments.done",
                 {
-                    "output_index": idx + 1,
+                    "output_index": output_index,
+                    "item_id": acc["fc_id"],
                     "arguments": acc["arguments"],
                 },
             )
@@ -218,13 +228,14 @@ def emit_done_events(state: StreamState, chunk: ChatCompletionStreamChunk) -> li
             _sse_line(
                 "response.output_item.done",
                 {
-                    "output_index": idx + 1,
+                    "output_index": output_index,
                     "item": {
                         "type": "function_call",
                         "id": acc.get("fc_id", ""),
                         "call_id": acc["id"],
                         "name": acc["name"],
                         "arguments": acc["arguments"],
+                        "status": "completed",
                     },
                 },
             )
@@ -293,6 +304,7 @@ async def stream_transform_iter(
     state = StreamState(response_id, model)
     raw_line_count = 0
     chunk_count = 0
+    logger.info("stream_transform_iter started: response_id=%s, model=%s", response_id, model)
 
     try:
         async for raw_line in chunk_iter:
@@ -325,6 +337,7 @@ async def stream_transform_iter(
                 continue
 
             for event_line in process_chunk(chunk, state):
+                logger.debug("Yielding event: %s", event_line[:150])
                 yield event_line
     except Exception as exc:
         logger.error("Stream iterator error: %s", exc)
@@ -345,10 +358,11 @@ async def stream_transform_iter(
 
     logger.info(
         "Stream transform complete: response.completed emitted, "
-        "raw_lines=%d, chunks=%d, text_len=%d",
+        "raw_lines=%d, chunks=%d, text_len=%d, tool_calls=%d",
         raw_line_count,
         chunk_count,
         len(state.text_accumulator),
+        len(state.tool_call_accumulators),
     )
 
     yield "event: response.done\ndata: {\"type\": \"response.done\"}\n\n"
@@ -359,8 +373,14 @@ async def stream_transform_iter(
         from app.conversation_store import store
 
         assistant_msg = _build_assistant_message(state)
-        store.save(response_id, messages + [assistant_msg])
-        logger.info("Saved conversation for response_id=%s", response_id)
+        full_messages = messages + [assistant_msg]
+        store.save(response_id, full_messages)
+        logger.info(
+            "Saved conversation for response_id=%s, msg_count=%d, has_tool_calls=%s",
+            response_id,
+            len(full_messages),
+            bool(state.tool_call_accumulators),
+        )
 
 
 def _sse_line(event_type: str, data: dict[str, Any]) -> str:
