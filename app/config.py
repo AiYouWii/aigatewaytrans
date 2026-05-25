@@ -11,6 +11,10 @@ class Settings(BaseSettings):
     # Fallback default when vLLM model info is unavailable.
     # This is automatically computed from vLLM's max_model_len at runtime.
     fallback_max_output_tokens: int = 16384
+    # Auto-truncate context when it exceeds the model's context window.
+    # Matches OpenAI's default truncation_strategy: "auto" behavior.
+    # Set to False to disable (not recommended for long tool-call chains).
+    auto_truncate: bool = True
 
     model_config = {"env_prefix": "AIGATEWAY_", "env_file": ".env"}
 

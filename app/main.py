@@ -98,6 +98,23 @@ async def create_response(request: Request):
             content={"error": f"Invalid request format: {e}"},
         )
 
+    logger.info(
+        "Raw request: model=%s, tool_choice=%s, parallel_tool_calls=%s, "
+        "has_tools=%s, stream=%s, max_output_tokens=%s, "
+        "previous_response_id=%s, input_type=%s, input_items=%d, "
+        "instructions_len=%d",
+        resp_request.model,
+        resp_request.tool_choice,
+        resp_request.parallel_tool_calls,
+        resp_request.tools is not None and len(resp_request.tools) > 0,
+        resp_request.stream,
+        resp_request.max_output_tokens,
+        resp_request.previous_response_id,
+        "str" if isinstance(resp_request.input, str) else "list",
+        len(resp_request.input) if isinstance(resp_request.input, list) else 1,
+        len(resp_request.instructions) if resp_request.instructions else 0,
+    )
+
     # Handle previous_response_id
     previous_messages = None
     if resp_request.previous_response_id:
@@ -140,6 +157,26 @@ async def create_response(request: Request):
         resp_request,
         previous_messages,
         max_output_tokens_default=dyn_max_output_tokens,
+        max_model_len=max_model_len,
+    )
+
+    # Diagnostic: log message breakdown by role and estimated context size
+    role_counts = {}
+    for m in chat_request.messages:
+        role_counts[m.role] = role_counts.get(m.role, 0) + 1
+    estimated_tokens = sum(
+        len(m.content or "") // 4
+        + (len(m.tool_calls or []) * 100 if m.tool_calls else 0)
+        for m in chat_request.messages
+    )
+    logger.info(
+        "Request context: msg_count=%d, roles=%s, estimated_tokens=%d, "
+        "max_model_len=%s, max_tokens=%s",
+        len(chat_request.messages),
+        role_counts,
+        estimated_tokens,
+        max_model_len,
+        chat_request.max_tokens,
     )
 
     if resp_request.stream:
@@ -158,9 +195,15 @@ async def create_response(request: Request):
     responses_response = transform_response(chat_response)
 
     # Store conversation — exclude system messages to prevent
-    # duplicate accumulation on follow-up turns.
+    # duplicate accumulation on follow-up turns. Include the
+    # assistant response so follow-up requests have full context.
     non_system = [m for m in chat_request.messages if m.role != "system"]
-    store.save(responses_response.id, non_system)
+    assistant_msg = chat_response.choices[0].message
+    if assistant_msg:
+        saved = non_system + [assistant_msg]
+    else:
+        saved = non_system
+    store.save(responses_response.id, saved)
 
     return JSONResponse(content=responses_response.model_dump(exclude_none=True))
 

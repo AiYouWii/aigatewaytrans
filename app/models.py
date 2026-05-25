@@ -68,6 +68,11 @@ class ReasoningConfig(BaseModel):
     summary: Literal["auto", "concise", "detailed"] | None = None
 
 
+class TruncationConfig(BaseModel):
+    type: Literal["auto", "last_turn"] = "auto"
+    last_messages: int | None = None
+
+
 class ResponsesAPIRequest(BaseModel):
     model: str
     input: str | list[ResponseInputItem] = Field(default_factory=list)
@@ -81,6 +86,7 @@ class ResponsesAPIRequest(BaseModel):
     max_output_tokens: int | None = None
     text: TextFormat | None = None
     reasoning: ReasoningConfig | None = None
+    truncation: TruncationConfig | None = None
     previous_response_id: str | None = None
     store: bool | None = None
     metadata: dict[str, Any] | None = None

@@ -23,6 +23,7 @@ def transform_request(
     request: ResponsesAPIRequest,
     previous_messages: list[ChatMessage] | None = None,
     max_output_tokens_default: int | None = None,
+    max_model_len: int | None = None,
 ) -> ChatCompletionRequest:
     raw_messages = []
 
@@ -76,6 +77,18 @@ def transform_request(
         messages.append(ChatMessage(role="system", content="\n\n".join(system_parts)))
     messages.extend(non_system)
 
+    # Compute max_tokens early — needed for truncation budget calculation.
+    max_tokens = request.max_output_tokens or max_output_tokens_default
+
+    # Auto-truncate context when it exceeds the model's limits.
+    # OpenAI's Responses API defaults to truncation_strategy: "auto",
+    # which silently drops old messages to keep the context manageable.
+    # Without this, long tool-call chains overwhelm the model, causing
+    # it to summarize with text instead of continuing tool execution.
+    from app.config import settings
+    if settings.auto_truncate and max_model_len and max_tokens:
+        messages = _auto_truncate(messages, max_model_len, max_tokens)
+
     tools = _transform_tools(request.tools)
 
     # Translate tool_choice from Responses API format to Chat Completions format.
@@ -114,11 +127,6 @@ def transform_request(
     reasoning_effort = None
     if request.reasoning and request.reasoning.effort:
         reasoning_effort = request.reasoning.effort
-
-    # Use max_output_tokens from the client if set; otherwise use the
-    # dynamically computed default (from vLLM's max_model_len) to ensure
-    # the model has enough room for full tool-call responses.
-    max_tokens = request.max_output_tokens or max_output_tokens_default
 
     logger.info(
         "Transformed request: model=%s, msg_count=%d, has_tools=%s, tool_choice=%s, parallel_tool_calls=%s, stream=%s, max_tokens=%s",
@@ -287,3 +295,125 @@ def _transform_tools(
                 )
 
     return result if result else None
+
+
+def _estimate_tokens(messages: list[ChatMessage]) -> int:
+    """Rough token estimate: ~4 chars per token + overhead for tool calls."""
+    total = 0
+    for m in messages:
+        if m.content:
+            total += len(m.content) // 4 + 10  # content + role overhead
+        if m.tool_calls:
+            for tc in m.tool_calls:
+                total += len(tc.function.arguments) // 4 + 20  # args + call metadata
+        total += 4  # role/field overhead per message
+    return total
+
+
+def _auto_truncate(
+    messages: list[ChatMessage],
+    max_model_len: int,
+    max_tokens: int,
+) -> list[ChatMessage]:
+    """Truncate old messages when context exceeds the model's limits.
+
+    Matches OpenAI's default truncation_strategy: "auto" behavior.
+    Keeps the system message and recent context, dropping old turns.
+    A "turn" boundary is a position where we can safely cut without
+    breaking conversation structure (before a user message, after
+    tool results, or after an assistant text-only response).
+    """
+    budget = max_model_len - max_tokens
+    if budget <= 0:
+        budget = max_model_len // 2
+
+    estimated = _estimate_tokens(messages)
+
+    if estimated <= budget:
+        return messages
+
+    # Find safe truncation points in the non-system messages.
+    # A safe point is before a user message, or at the start
+    # (we always keep the system message).
+    system_msg = messages[0] if messages and messages[0].role == "system" else None
+    rest = messages[1:] if system_msg else messages
+
+    # Identify turn boundaries: positions before user messages or
+    # after tool/assistant exchanges where cutting won't break structure.
+    boundaries: list[int] = []
+    for i, m in enumerate(rest):
+        if m.role == "user":
+            boundaries.append(i)
+        # After an assistant text-only response that follows tool
+        # results — this completes a full exchange cycle.
+        if i > 0 and m.role == "assistant" and not m.tool_calls:
+            prev = rest[i - 1]
+            if prev.role == "tool":
+                boundaries.append(i + 1)
+
+    if not boundaries:
+        # No safe boundaries found; keep system + last few messages
+        logger.warning(
+            "No safe truncation boundaries found; keeping system + "
+            "last 20 messages. original=%d, estimated_tokens=%d, budget=%d",
+            len(messages),
+            estimated,
+            budget,
+        )
+        keep = rest[-20:] if len(rest) > 20 else rest
+        return [system_msg] + keep if system_msg else keep
+
+    # Try each boundary from the earliest, removing messages before it
+    # until the estimated tokens fit within budget.
+    for boundary in boundaries:
+        truncated_rest = rest[boundary:]
+        truncated = [system_msg] + truncated_rest if system_msg else truncated_rest
+        new_estimated = _estimate_tokens(truncated)
+        if new_estimated <= budget:
+            removed = len(messages) - len(truncated)
+            logger.info(
+                "Auto-truncated: removed %d old messages, "
+                "kept %d (estimated_tokens=%d→%d, budget=%d). "
+                "This matches OpenAI's truncation_strategy:auto behavior.",
+                removed,
+                len(truncated),
+                estimated,
+                new_estimated,
+                budget,
+            )
+            return truncated
+
+    # If all boundaries still exceed budget, keep only system + last turn
+    # (the most recent user/assistant/tool exchange).
+    # Find the last user message and keep everything after it.
+    last_user_idx = -1
+    for i in range(len(rest) - 1, -1, -1):
+        if rest[i].role == "user":
+            last_user_idx = i
+            break
+
+    if last_user_idx >= 0:
+        truncated_rest = rest[last_user_idx:]
+        truncated = [system_msg] + truncated_rest if system_msg else truncated_rest
+        removed = len(messages) - len(truncated)
+        logger.warning(
+            "Aggressive truncation: keeping only system + last turn "
+            "(%d messages, removed=%d). estimated_tokens=%d, budget=%d",
+            len(truncated),
+            removed,
+            _estimate_tokens(truncated),
+            budget,
+        )
+        return truncated
+
+    # Fallback: keep system + last 10 messages
+    keep = rest[-10:] if len(rest) > 10 else rest
+    truncated = [system_msg] + keep if system_msg else keep
+    logger.warning(
+        "Fallback truncation: keeping system + last 10 messages. "
+        "original=%d, estimated_tokens=%d, budget=%d",
+        len(messages),
+        estimated,
+        budget,
+    )
+    return truncated
