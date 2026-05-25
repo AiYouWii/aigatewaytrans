@@ -94,7 +94,15 @@ def transform_request(
     # Translate tool_choice from Responses API format to Chat Completions format.
     # Responses API uses {"type": "function", "name": "func_name"}
     # Chat Completions uses {"type": "function", "function": {"name": "func_name"}}
-    # OpenAI defaults to tool_choice="auto" when tools are present.
+    #
+    # Default tool_choice logic:
+    # - "auto": model decides whether to call tools or respond with text
+    # - "required": model MUST call at least one tool (can still include text)
+    #
+    # When continuing a tool chain (last message is a tool result),
+    # use "required" to prevent the model from producing text-only
+    # summaries that break the chain. OpenAI's GPT-4o aggressively
+    # uses tools by default; other models need explicit instruction.
     tool_choice = None
     if request.tool_choice:
         if isinstance(request.tool_choice, str):
@@ -108,7 +116,10 @@ def transform_request(
             else:
                 tool_choice = request.tool_choice
     elif tools:
-        tool_choice = "auto"
+        if messages and messages[-1].role == "tool":
+            tool_choice = "required"
+        else:
+            tool_choice = "auto"
 
     parallel_tool_calls = request.parallel_tool_calls
     if parallel_tool_calls is None and tools:
