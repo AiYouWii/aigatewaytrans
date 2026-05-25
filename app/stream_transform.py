@@ -42,6 +42,11 @@ def emit_initial_events(state: StreamState) -> list[str]:
                     "model": state.model,
                     "status": "in_progress",
                     "output": [],
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                    },
                     "created_at": state.created_at,
                 },
             },
@@ -250,13 +255,13 @@ def emit_done_events(state: StreamState, chunk: ChatCompletionStreamChunk) -> li
     status = "completed" if finish_reason in ("stop", "tool_calls") else "incomplete"
     end_turn = finish_reason == "stop"
 
-    usage_data = None
-    if chunk.usage:
-        usage_data = {
-            "input_tokens": chunk.usage.prompt_tokens,
-            "output_tokens": chunk.usage.completion_tokens,
-            "total_tokens": chunk.usage.total_tokens,
-        }
+    # Always include usage as a non-null object to avoid nil pointer
+    # dereference in upstream gateways (one-api / new-api).
+    usage_data = {
+        "input_tokens": chunk.usage.prompt_tokens if chunk.usage else 0,
+        "output_tokens": chunk.usage.completion_tokens if chunk.usage else 0,
+        "total_tokens": chunk.usage.total_tokens if chunk.usage else 0,
+    }
 
     lines.append(
         _sse_line(

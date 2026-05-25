@@ -117,7 +117,12 @@ async def _stream_response(chat_request, response_id: str, model: str):
                     "model": model,
                     "status": "failed",
                     "output": [],
-                    "error": str(e),
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                    "end_turn": False,
                 },
             },
         )
