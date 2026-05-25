@@ -15,6 +15,20 @@ from app.models import (
 )
 
 
+_TOOL_CONTINUATION_HINT = (
+    "IMPORTANT: You must continue executing tools step by step until all "
+    "requested changes are fully completed. Do NOT stop early to provide "
+    "a summary or conclusion. Only output a final response after every "
+    "modification has been applied. If there are more steps to complete "
+    "the task, call the appropriate tool instead of summarizing."
+)
+
+_TOOL_RESULT_HINT = (
+    "\n\n[Continue with the next tool call if more work remains "
+    "to complete the task. Do not provide a summary prematurely.]"
+)
+
+
 def transform_request(
     request: ResponsesAPIRequest,
     previous_messages: list[ChatMessage] | None = None,
@@ -23,6 +37,12 @@ def transform_request(
 
     if request.instructions:
         raw_messages.append(ChatMessage(role="system", content=request.instructions))
+
+    # Inject continuation instructions when tools are available to prevent
+    # the model from stopping early with a summary instead of making tool calls.
+    has_tools = request.tools is not None and len(request.tools) > 0
+    if has_tools:
+        raw_messages.append(ChatMessage(role="system", content=_TOOL_CONTINUATION_HINT))
 
     if previous_messages:
         raw_messages.extend(previous_messages)
@@ -41,7 +61,7 @@ def transform_request(
         raw_messages.append(ChatMessage(role="user", content=request.input))
     elif isinstance(request.input, list):
         for item in request.input:
-            msg = _transform_input_item(item, existing_call_ids)
+            msg = _transform_input_item(item, existing_call_ids, has_tools)
             if msg:
                 raw_messages.append(msg)
 
@@ -93,6 +113,7 @@ def transform_request(
 def _transform_input_item(
     item: dict | object,
     existing_call_ids: set[str] | None = None,
+    has_tools: bool = False,
 ) -> ChatMessage | None:
     if isinstance(item, dict):
         item_type = item.get("type")
@@ -111,10 +132,15 @@ def _transform_input_item(
             result = FunctionCallResult(**item)
         else:
             result = item
+        content = result.output
+        # Append continuation hint to tool results when tools are available,
+        # nudging the model to keep executing instead of summarizing prematurely.
+        if has_tools:
+            content += _TOOL_RESULT_HINT
         return ChatMessage(
             role="tool",
             tool_call_id=result.call_id,
-            content=result.output,
+            content=content,
         )
 
     if item_type == "function_call":

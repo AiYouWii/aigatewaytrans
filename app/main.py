@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import logging.handlers
+import os
 import time
 import uuid
 
@@ -21,8 +23,40 @@ from app.response_transform import transform_response
 from app.stream_transform import stream_transform_iter
 from app.vllm_client import vllm_client
 
-logging.basicConfig(level=getattr(logging, settings.log_level))
-logger = logging.getLogger("aigateway")
+def _setup_logging() -> logging.Logger:
+    log_format = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+    formatter = logging.Formatter(log_format, datefmt="%Y-%m-%d %H:%M:%S")
+
+    level = getattr(logging, settings.log_level, logging.INFO)
+
+    app_logger = logging.getLogger("aigateway")
+    app_logger.setLevel(level)
+
+    # Console handler (always active)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    app_logger.addHandler(stream_handler)
+
+    # File handler (when log_file is configured)
+    if settings.log_file:
+        log_dir = os.path.dirname(settings.log_file)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        file_handler = logging.handlers.RotatingFileHandler(
+            settings.log_file,
+            maxBytes=settings.log_file_max_bytes,
+            backupCount=settings.log_file_backup_count,
+        )
+        file_handler.setFormatter(formatter)
+        app_logger.addHandler(file_handler)
+
+    # Fallback basicConfig for uvicorn/access logs
+    logging.basicConfig(level=level, format=log_format, datefmt="%Y-%m-%d %H:%M:%S")
+
+    return app_logger
+
+
+logger = _setup_logging()
 
 app = FastAPI(title="AIGateway", version="0.1.0")
 

@@ -365,6 +365,18 @@ async def stream_transform_iter(
         len(state.tool_call_accumulators),
     )
 
+    # Warn when the model produces a text-only response without tool calls,
+    # which likely means it summarized prematurely instead of continuing work.
+    if state.text_accumulator and not state.tool_call_accumulators and state.finished:
+        finish_reason = ""
+        # We can't easily access the finish_reason here since state doesn't store it,
+        # but the warning is still useful for diagnostics.
+        logger.warning(
+            "Model stopped with text-only response (no tool calls). "
+            "This may indicate premature summary. text_len=%d",
+            len(state.text_accumulator),
+        )
+
     yield "event: response.done\ndata: {\"type\": \"response.done\"}\n\n"
 
     # Save conversation so follow-up requests with previous_response_id
