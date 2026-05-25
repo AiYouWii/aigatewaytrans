@@ -6,7 +6,7 @@ import time
 import uuid
 from typing import Any
 
-from app.models import ChatCompletionStreamChunk
+from app.models import ChatCompletionStreamChunk, ChatMessage, ChatToolCall, ChatToolCallFunction
 
 logger = logging.getLogger("aigateway")
 
@@ -288,6 +288,7 @@ async def stream_transform_iter(
     chunk_iter,
     response_id: str,
     model: str | None = None,
+    messages: list[ChatMessage] | None = None,
 ):
     state = StreamState(response_id, model)
     raw_line_count = 0
@@ -352,9 +353,38 @@ async def stream_transform_iter(
 
     yield "event: response.done\ndata: {\"type\": \"response.done\"}\n\n"
 
+    # Save conversation so follow-up requests with previous_response_id
+    # can retrieve the full message history including this response.
+    if messages is not None:
+        from app.conversation_store import store
+
+        assistant_msg = _build_assistant_message(state)
+        store.save(response_id, messages + [assistant_msg])
+        logger.info("Saved conversation for response_id=%s", response_id)
+
 
 def _sse_line(event_type: str, data: dict[str, Any]) -> str:
     # Codex CLI requires a "type" field in each SSE data payload
     # for serde deserialization.  It must match the event type string.
     payload = {**data, "type": event_type}
     return f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
+
+
+def _build_assistant_message(state: StreamState) -> ChatMessage:
+    tool_calls = None
+    if state.tool_call_accumulators:
+        tool_calls = []
+        for idx in sorted(state.tool_call_accumulators):
+            acc = state.tool_call_accumulators[idx]
+            tool_calls.append(
+                ChatToolCall(
+                    id=acc["id"],
+                    function=ChatToolCallFunction(
+                        name=acc["name"],
+                        arguments=acc["arguments"],
+                    ),
+                )
+            )
+
+    content = state.text_accumulator or None
+    return ChatMessage(role="assistant", content=content, tool_calls=tool_calls)

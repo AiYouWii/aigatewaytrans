@@ -103,13 +103,7 @@ class VLLMClient:
 
     async def proxy(self, method: str, path: str, headers: dict, body: bytes) -> httpx.Response:
         client = await self._get_client()
-
-        return await client.request(
-            method,
-            path,
-            headers=headers,
-            content=body,
-        )
+        return await client.request(method, path, headers=headers, content=body)
 
     async def models(self) -> list[dict[str, Any]]:
         client = await self._get_client()

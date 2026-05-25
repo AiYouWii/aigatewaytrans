@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import httpx
 import json
 import logging
 import uuid
@@ -69,6 +68,10 @@ async def create_response(request: Request):
     if resp_request.previous_response_id:
         previous_messages = store.get(resp_request.previous_response_id)
         if previous_messages is None:
+            logger.warning(
+                "previous_response_id '%s' not found in store",
+                resp_request.previous_response_id,
+            )
             return JSONResponse(
                 status_code=404,
                 content={
@@ -85,7 +88,6 @@ async def create_response(request: Request):
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
             },
         )
@@ -102,12 +104,13 @@ async def create_response(request: Request):
 async def _stream_response(chat_request, response_id: str, model: str):
     try:
         line_iter = vllm_client.stream(chat_request)
-        async for event in stream_transform_iter(line_iter, response_id, model):
+        async for event in stream_transform_iter(
+            line_iter, response_id, model, chat_request.messages
+        ):
             yield event
     except Exception as e:
         logger.error("Stream error: %s", e)
         yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
-        # Emit a completed event so the client doesn't hang waiting for it.
         yield _sse_line(
             "response.completed",
             {
@@ -142,7 +145,9 @@ async def shutdown():
 
 # ─── Catch-all proxy: forward unmatched requests to vLLM ───
 
-_PROXY_SKIP_HEADERS = {"content-encoding", "content-length", "transfer-encoding", "connection"}
+_PROXY_SKIP_HEADERS = {
+    "content-encoding", "content-length", "transfer-encoding", "connection",
+}
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
@@ -150,7 +155,6 @@ async def proxy_to_vllm(request: Request, path: str):
     vllm_path = f"/{path}"
     logger.debug("Proxying %s %s → vLLM", request.method, vllm_path)
 
-    # Strip hop-by-hop headers that must not be forwarded.
     headers = {
         key: value
         for key, value in request.headers.items()
@@ -160,7 +164,6 @@ async def proxy_to_vllm(request: Request, path: str):
 
     resp = await vllm_client.proxy(request.method, vllm_path, headers, body)
 
-    # Build response headers, stripping hop-by-hop headers.
     resp_headers = {}
     for key, value in resp.headers.items():
         if key.lower() not in _PROXY_SKIP_HEADERS:
@@ -183,7 +186,7 @@ async def proxy_to_vllm(request: Request, path: str):
     )
 
 
-async def _relay_stream(resp: httpx.Response):
+async def _relay_stream(resp):
     async for chunk in resp.aiter_bytes():
         yield chunk
 
