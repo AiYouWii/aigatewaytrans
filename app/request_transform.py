@@ -61,6 +61,18 @@ def transform_request(
             if msg:
                 raw_messages.append(msg)
 
+    # Merge consecutive assistant messages into single messages.
+    # In the Responses API, a single assistant turn produces:
+    #   - A message item (text content, role="assistant")
+    #   - One or more function_call items (tool calls)
+    # Our _transform_input_item creates separate ChatMessage for each,
+    # resulting in multiple consecutive assistant messages. But Chat
+    # Completions requires ALL content and tool_calls from one turn in
+    # ONE assistant message. Without this merge, the conversation has
+    # invalid structure (70 assistant messages instead of ~35), which
+    # confuses the model and causes text-only responses.
+    raw_messages = _merge_assistant_messages(raw_messages)
+
     # vLLM requires a single system message at the beginning.
     # Merge all system-role messages into one, then keep non-system messages in order.
     system_parts: list[str] = []
@@ -99,10 +111,11 @@ def transform_request(
     # - "auto": model decides whether to call tools or respond with text
     # - "required": model MUST call at least one tool (can still include text)
     #
-    # When continuing a tool chain (last message is a tool result),
-    # use "required" to prevent the model from producing text-only
-    # summaries that break the chain. OpenAI's GPT-4o aggressively
-    # uses tools by default; other models need explicit instruction.
+    # Codex is an agentic coding assistant — it always expects tool use.
+    # When tools are present, use "required" to prevent the model from
+    # producing text-only summaries that break the tool chain. This
+    # matches Codex's expectation: the model should act, not just describe.
+    # If the client explicitly sets tool_choice, respect it.
     tool_choice = None
     if request.tool_choice:
         if isinstance(request.tool_choice, str):
@@ -116,10 +129,7 @@ def transform_request(
             else:
                 tool_choice = request.tool_choice
     elif tools:
-        if messages and messages[-1].role == "tool":
-            tool_choice = "required"
-        else:
-            tool_choice = "auto"
+        tool_choice = "required"
 
     # When the model is in a tool chain (tool_choice="required"),
     # reinforce the system message to prevent text-only summaries.
@@ -448,3 +458,72 @@ def _auto_truncate(
         budget,
     )
     return truncated
+
+
+def _merge_assistant_messages(messages: list[ChatMessage]) -> list[ChatMessage]:
+    """Merge consecutive assistant messages into single messages.
+
+    In the Responses API, a single assistant turn produces:
+    - A message item (role="assistant", text content)
+    - One or more function_call items (tool calls)
+
+    Our _transform_input_item creates a separate ChatMessage for each,
+    resulting in multiple consecutive assistant messages. But the Chat
+    Completions format requires ALL content and tool_calls from one
+    assistant turn to be in ONE message. Without this merge, the model
+    sees invalid structure (e.g. 70 assistant msgs instead of ~35),
+    which breaks the conversation format and causes text-only responses.
+    """
+    if not messages:
+        return messages
+
+    result: list[ChatMessage] = []
+    i = 0
+    merged_count = 0
+    while i < len(messages):
+        msg = messages[i]
+        if msg.role == "assistant":
+            # Start collecting consecutive assistant messages
+            parts_content: list[str] = []
+            all_tool_calls: list[ChatToolCall] = []
+
+            if msg.content:
+                parts_content.append(msg.content)
+            if msg.tool_calls:
+                all_tool_calls.extend(msg.tool_calls)
+
+            j = i + 1
+            while j < len(messages) and messages[j].role == "assistant":
+                next_msg = messages[j]
+                if next_msg.content:
+                    parts_content.append(next_msg.content)
+                if next_msg.tool_calls:
+                    all_tool_calls.extend(next_msg.tool_calls)
+                j += 1
+
+            if j > i + 1:
+                merged_count += j - i - 1
+
+            combined_content = "\n".join(parts_content) if parts_content else None
+            combined_tool_calls = all_tool_calls if all_tool_calls else None
+
+            result.append(ChatMessage(
+                role="assistant",
+                content=combined_content,
+                tool_calls=combined_tool_calls,
+            ))
+            i = j
+        else:
+            result.append(msg)
+            i += 1
+
+    if merged_count > 0:
+        logger.info(
+            "Merged %d consecutive assistant messages into proper turns "
+            "(%d → %d total messages)",
+            merged_count,
+            len(messages),
+            len(result),
+        )
+
+    return result

@@ -1,14 +1,15 @@
 services:
   aigateway:
     build: .
-    ports:
-      - "9000:9000"
+    container_name: aigateway       
+    network_mode: host           
     volumes:
-      - aigateway-logs:/var/log/aigateway
+      - /data/aigatewaytrans/:/app/ 
+      - ./logs:/var/log/aigateway  
     env_file: .env
     environment:
-      AIGATEWAY_LOG_FILE: /var/log/aigateway/app.log
+      AIGATEWAY_LOG_FILE: /var/log/aigateway/app.log  
     restart: unless-stopped
 
 volumes:
-  aigateway-logs:
+  aigateway-logs:  
