@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     # Matches OpenAI's default truncation_strategy: "auto" behavior.
     # Set to False to disable (not recommended for long tool-call chains).
     auto_truncate: bool = True
+    # When the model is in a tool chain (received a tool result), reinforce
+    # the system message with a brief instruction to continue using tools.
+    # This prevents text-only summaries that break the tool chain.
+    # OpenAI's GPT-4o naturally continues tool chains; other models need
+    # explicit instruction. Set to False for pure faithful translation.
+    reinforce_tool_use: bool = True
 
     model_config = {"env_prefix": "AIGATEWAY_", "env_file": ".env"}
 

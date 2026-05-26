@@ -121,6 +121,26 @@ def transform_request(
         else:
             tool_choice = "auto"
 
+    # When the model is in a tool chain (tool_choice="required"),
+    # reinforce the system message to prevent text-only summaries.
+    # OpenAI's GPT-4o naturally continues tool chains; other models
+    # (e.g. Qwen3) tend to summarize prematurely without this.
+    if tool_choice == "required" and settings.reinforce_tool_use:
+        _TOOL_USE_REINFORCEMENT = (
+            "\n\nImportant: You are in the middle of executing a multi-step task. "
+            "You must continue by calling the appropriate tool(s). "
+            "Do NOT respond with only text or a summary. "
+            "Always produce at least one tool call to continue the work."
+        )
+        for i, m in enumerate(messages):
+            if m.role == "system":
+                messages[i] = ChatMessage(
+                    role="system",
+                    content=m.content + _TOOL_USE_REINFORCEMENT,
+                )
+                logger.info("Reinforced system message for tool chain continuation")
+                break
+
     parallel_tool_calls = request.parallel_tool_calls
     if parallel_tool_calls is None and tools:
         parallel_tool_calls = True

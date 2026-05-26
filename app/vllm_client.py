@@ -41,7 +41,18 @@ class VLLMClient:
         for key in _UNSUPPORTED_PARAMS:
             payload.pop(key, None)
 
-        logger.debug("vLLM request payload: %s", payload)
+        # Key parameters sent to vLLM — always log at INFO for diagnostics
+        logger.info(
+            "vLLM payload: model=%s, msg_count=%d, tool_choice=%s, "
+            "parallel_tool_calls=%s, has_tools=%s, max_tokens=%s, stream=%s",
+            payload.get("model"),
+            len(payload.get("messages", [])),
+            payload.get("tool_choice"),
+            payload.get("parallel_tool_calls"),
+            payload.get("tools") is not None,
+            payload.get("max_tokens"),
+            payload.get("stream"),
+        )
         return payload
 
     async def complete(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
