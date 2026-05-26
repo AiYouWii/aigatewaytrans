@@ -107,19 +107,22 @@ def transform_request(
     # Responses API uses {"type": "function", "name": "func_name"}
     # Chat Completions uses {"type": "function", "function": {"name": "func_name"}}
     #
-    # Default tool_choice logic:
-    # - "auto": model decides whether to call tools or respond with text
-    # - "required": model MUST call at least one tool (can still include text)
-    #
-    # Codex is an agentic coding assistant — it always expects tool use.
-    # When tools are present, use "required" to prevent the model from
-    # producing text-only summaries that break the tool chain. This
-    # matches Codex's expectation: the model should act, not just describe.
-    # If the client explicitly sets tool_choice, respect it.
+    # Codex sends tool_choice="auto" even when in a tool chain. Other models
+    # (e.g. Qwen3) interpret "auto" as "you MAY respond with text instead of
+    # calling tools", which causes premature text-only summaries that break
+    # the tool chain. When the conversation already contains tool messages,
+    # the agent is mid-execution — upgrade "auto" to "required" so the model
+    # must continue calling tools.
     tool_choice = None
+    has_tool_history = any(m.role == "tool" for m in raw_messages)
+
     if request.tool_choice:
         if isinstance(request.tool_choice, str):
-            tool_choice = request.tool_choice
+            if request.tool_choice == "auto" and tools and has_tool_history:
+                tool_choice = "required"
+                logger.info("Upgraded tool_choice: auto → required (tool chain detected)")
+            else:
+                tool_choice = request.tool_choice
         elif isinstance(request.tool_choice, dict):
             if request.tool_choice.get("type") == "function":
                 tool_choice = {
@@ -339,7 +342,12 @@ def _transform_tools(
 
 
 def _estimate_tokens(messages: list[ChatMessage]) -> int:
-    """Rough token estimate: ~4 chars per token + overhead for tool calls."""
+    """Rough token estimate: ~4 chars per token + overhead for tool calls.
+
+    Observed ratio between estimated and actual tokens is ~1.78x
+    (estimated 64,840 vs actual 114,689). Apply a safety factor of
+    1.8 to ensure auto_truncate kicks in BEFORE actual overflow.
+    """
     total = 0
     for m in messages:
         if m.content:
@@ -348,7 +356,7 @@ def _estimate_tokens(messages: list[ChatMessage]) -> int:
             for tc in m.tool_calls:
                 total += len(tc.function.arguments) // 4 + 20  # args + call metadata
         total += 4  # role/field overhead per message
-    return total
+    return int(total * 1.8)
 
 
 def _auto_truncate(

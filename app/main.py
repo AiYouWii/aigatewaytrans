@@ -4,6 +4,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import time
 import uuid
 
@@ -191,7 +192,19 @@ async def create_response(request: Request):
             },
         )
 
-    chat_response = await vllm_client.complete(chat_request)
+    try:
+        chat_response = await vllm_client.complete(chat_request)
+    except Exception as exc:
+        error_text = str(exc)
+        # Handle vLLM context overflow — return actionable error to agent
+        if "maximum context length" in error_text or "context overflow" in error_text.lower():
+            logger.warning("vLLM context overflow (non-streaming): %s", error_text[:300])
+            return JSONResponse(
+                status_code=400,
+                content=_build_overflow_error_response(error_text, resp_request.model),
+            )
+        raise
+
     responses_response = transform_response(chat_response)
 
     # Store conversation — exclude system messages to prevent
@@ -222,8 +235,19 @@ async def _stream_response(chat_request, response_id: str, model: str):
                 logger.debug("Stream event #%d: %s", event_count, event[:120] if isinstance(event, str) else str(event)[:120])
             yield event
     except Exception as e:
+        error_text = str(e)
+        # Handle vLLM context overflow — emit actionable error as assistant text
+        # with end_turn=False so the agent can compress and retry.
+        if "maximum context length" in error_text or "context overflow" in error_text.lower():
+            logger.warning("vLLM context overflow (streaming): %s", error_text[:300])
+            for event in _build_overflow_sse_events(response_id, model, error_text):
+                yield event
+            yield 'event: response.done\ndata: {"type": "response.done"}\n\n'
+            return
+
+        # Other stream errors — fallback format
         logger.error("Stream error: %s", e)
-        yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+        yield f"event: error\ndata: {json.dumps({'error': error_text})}\n\n"
         yield _sse_line(
             "response.completed",
             {
@@ -255,6 +279,178 @@ def _sse_line(event_type: str, data: dict) -> str:
 @app.on_event("shutdown")
 async def shutdown():
     await vllm_client.close()
+
+
+def _parse_context_overflow(error_text: str) -> dict | None:
+    """Parse vLLM context overflow error to extract token counts.
+
+    vLLM returns messages like:
+    "This model's maximum context length is 131072 tokens...
+     your prompt contains at least 114689 input tokens and 16384
+     requested output tokens, for a total of at least 131073 tokens."
+    """
+    max_match = re.search(r"maximum context length is (\d+)", error_text)
+    input_match = re.search(r"at least (\d+) input tokens", error_text)
+    output_match = re.search(r"(\d+) requested output tokens", error_text)
+    total_match = re.search(r"total of at least (\d+) tokens", error_text)
+
+    if max_match and (input_match or total_match):
+        return {
+            "max_context": int(max_match.group(1)),
+            "input_tokens": int(input_match.group(1)) if input_match else None,
+            "requested_output_tokens": int(output_match.group(1)) if output_match else None,
+            "total_tokens": int(total_match.group(1)) if total_match else None,
+        }
+    return None
+
+
+def _build_overflow_error_response(error_text: str, model: str) -> dict:
+    """Build a Responses API error response for context overflow.
+
+    Returns actionable information so the agent can compress or retry.
+    """
+    parsed = _parse_context_overflow(error_text)
+
+    if parsed:
+        return {
+            "error": {
+                "type": "context_overflow",
+                "message": (
+                    f"Context exceeds model limit: "
+                    f"{parsed['input_tokens']} input tokens + "
+                    f"{parsed['requested_output_tokens']} requested output tokens = "
+                    f"{parsed['total_tokens']} total > "
+                    f"{parsed['max_context']} max context. "
+                    f"Please compress the conversation context or reduce output length and retry."
+                ),
+                "max_context_tokens": parsed["max_context"],
+                "input_tokens": parsed["input_tokens"],
+                "requested_output_tokens": parsed["requested_output_tokens"],
+                "total_tokens": parsed["total_tokens"],
+                "suggestion": "compress_context_or_retry",
+            },
+        }
+    else:
+        return {
+            "error": {
+                "type": "context_overflow",
+                "message": f"Context overflow error from backend: {error_text[:500]}. Please compress the conversation context or reduce output length and retry.",
+                "suggestion": "compress_context_or_retry",
+            },
+        }
+
+
+def _build_overflow_sse_events(response_id: str, model: str, error_text: str) -> list[str]:
+    """Build SSE events for context overflow error in streaming mode.
+
+    Codex CLI expects: response.created → response.output_item.added →
+    response.content_part.added → output_text.delta → ... → response.completed
+    For an error, we emit a minimal valid stream with the error message
+    as assistant text content, then response.completed with end_turn=False
+    so Codex can see the error and decide to compress/retry.
+    """
+    error_data = _build_overflow_error_response(error_text, model)
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+    created_at = int(time.time())
+    error_msg = error_data["error"]["message"]
+
+    events = [
+        _sse_line(
+            "response.created",
+            {
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "model": model,
+                    "status": "in_progress",
+                    "output": [],
+                    "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                    "created_at": created_at,
+                },
+            },
+        ),
+        _sse_line(
+            "response.output_item.added",
+            {
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": msg_id,
+                    "role": "assistant",
+                    "content": [],
+                },
+            },
+        ),
+        _sse_line(
+            "response.content_part.added",
+            {
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": ""},
+            },
+        ),
+        _sse_line(
+            "response.output_text.delta",
+            {
+                "output_index": 0,
+                "content_index": 0,
+                "delta": error_msg,
+            },
+        ),
+        _sse_line(
+            "response.output_text.done",
+            {
+                "output_index": 0,
+                "content_index": 0,
+                "text": error_msg,
+            },
+        ),
+        _sse_line(
+            "response.content_part.done",
+            {
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": error_msg},
+            },
+        ),
+        _sse_line(
+            "response.output_item.done",
+            {
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": msg_id,
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": error_msg}],
+                },
+            },
+        ),
+        _sse_line(
+            "response.completed",
+            {
+                "response": {
+                    "id": response_id,
+                    "object": "response",
+                    "model": model,
+                    "status": "incomplete",
+                    "output": [
+                        {
+                            "type": "message",
+                            "id": msg_id,
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": error_msg}],
+                        },
+                    ],
+                    "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                    "created_at": created_at,
+                    "end_turn": False,
+                    "error": error_data["error"],
+                },
+            },
+        ),
+    ]
+
+    return events
 
 
 # ─── Catch-all proxy: forward unmatched requests to vLLM ───
